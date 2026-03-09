@@ -2,14 +2,27 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import ta
-import plotly.graph_objects as go
 import requests
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="Momentum Breakout Scanner", layout="wide")
+st.set_page_config(page_title="AI Momentum Scanner", layout="wide")
 
 st.title("🚀 AI Momentum Breakout Scanner")
 
-# ---------- TELEGRAM ----------
+# 股票列表
+symbols = st.text_input(
+    "Stock List",
+    "TSLA,NVDA,COIN,PLTR,AMD,META"
+)
+
+interval = st.selectbox(
+    "Timeframe",
+    ["15m","30m","1h","1d"]
+)
+
+symbol_list = [s.strip() for s in symbols.split(",")]
+
+# Telegram secrets
 BOT_TOKEN = st.secrets["telegram"]["bot_token"]
 CHAT_ID = st.secrets["telegram"]["chat_id"]
 
@@ -25,99 +38,88 @@ def send_telegram(msg):
     requests.post(url, data=payload)
 
 
-# ---------- INPUT ----------
-ticker = st.text_input("Stock", "TSLA")
+breakouts = []
 
-interval = st.selectbox(
-    "Timeframe",
-    ["15m","30m","1h","1d"]
-)
+for ticker in symbol_list:
 
-period = "3mo"
+    try:
 
-# ---------- DOWNLOAD DATA ----------
-data = yf.download(ticker, period=period, interval=interval)
+        data = yf.download(ticker, period="3mo", interval=interval)
 
-# FIX pandas multi column bug
-data.columns = data.columns.get_level_values(0)
+        if data.empty:
+            continue
 
-data = data.dropna()
+        # 修復 pandas multi column bug
+        data.columns = data.columns.get_level_values(0)
 
-close = data["Close"]
-high = data["High"]
-low = data["Low"]
-volume = data["Volume"]
+        close = data["Close"]
+        high = data["High"]
+        low = data["Low"]
+        volume = data["Volume"]
 
-# ---------- INDICATORS ----------
+        # 指標
+        data["EMA50"] = ta.trend.ema_indicator(close, window=50)
 
-data["EMA20"] = ta.trend.ema_indicator(close, window=20)
-data["EMA50"] = ta.trend.ema_indicator(close, window=50)
+        macd = ta.trend.MACD(close)
 
-macd = ta.trend.MACD(close)
+        data["MACD"] = macd.macd()
+        data["MACD_signal"] = macd.macd_signal()
 
-data["MACD"] = macd.macd()
-data["MACD_signal"] = macd.macd_signal()
+        data["Momentum"] = close - close.shift(10)
+        data["MomentumMA"] = data["Momentum"].rolling(10).mean()
 
-data["Momentum"] = close - close.shift(10)
+        data["VolumeMA"] = volume.rolling(20).mean()
 
-data["VolumeMA"] = volume.rolling(20).mean()
+        atr = ta.volatility.average_true_range(high, low, close, window=14)
+        data["ATR"] = atr
+        data["ATR_MA"] = atr.rolling(20).mean()
 
-data["RVOL"] = volume / data["VolumeMA"]
+        # breakout logic
+        data["Breakout"] = (
+            (data["Momentum"] > data["MomentumMA"]) &
+            (data["MACD"] > data["MACD_signal"]) &
+            (volume > 2 * data["VolumeMA"]) &
+            (close > data["EMA50"]) &
+            (data["ATR"] < data["ATR_MA"])
+        )
 
-data["ATR"] = ta.volatility.average_true_range(
-    high,
-    low,
-    close,
-    window=14
-)
+        latest = data.iloc[-1]
 
-data["ATR_MA"] = data["ATR"].rolling(20).mean()
+        if latest["Breakout"]:
+            breakouts.append((ticker, latest["Close"]))
 
-# ---------- SIGNAL ----------
+    except:
+        pass
 
-data["Breakout"] = (
-    (data["Momentum"] > 0) &
-    (data["MACD"] > data["MACD_signal"]) &
-    (data["Close"] > data["EMA50"]) &
-    (data["RVOL"] > 2) &
-    (data["ATR"] < data["ATR_MA"])
-)
 
-latest = data.iloc[-1]
+st.subheader("🔥 Breakout Stocks")
 
-# ---------- TELEGRAM ALERT ----------
+if len(breakouts) == 0:
+    st.write("No breakout detected")
 
-if "alert_sent" not in st.session_state:
-    st.session_state.alert_sent = False
+for stock, price in breakouts:
 
-if latest["Breakout"] and not st.session_state.alert_sent:
+    st.success(f"{stock} Breakout - Price {round(price,2)}")
 
-    msg = f"""
+    message = f"""
 🚀 MOMENTUM BREAKOUT
 
-Stock: {ticker}
-Price: {round(latest['Close'],2)}
+Stock: {stock}
+Price: {round(price,2)}
 
-Momentum Positive
+Momentum ↑
 MACD Golden Cross
-Relative Volume > 2
-
-Timeframe: {interval}
+Volume Spike
 """
 
-    send_telegram(msg)
-
-    st.session_state.alert_sent = True
-
-    st.success("Telegram Alert Sent")
-
-elif not latest["Breakout"]:
-    st.session_state.alert_sent = False
+    send_telegram(message)
 
 
-# ---------- CHART ----------
+# 圖表
+ticker_chart = st.selectbox("Chart", symbol_list)
 
-st.subheader("Price Chart")
+data = yf.download(ticker_chart, period="3mo", interval=interval)
+data.columns = data.columns.get_level_values(0)
 
 fig = go.Figure()
 
@@ -129,43 +131,4 @@ fig.add_trace(go.Candlestick(
     close=data["Close"]
 ))
 
-fig.add_trace(go.Scatter(
-    x=data.index,
-    y=data["EMA20"],
-    name="EMA20"
-))
-
-fig.add_trace(go.Scatter(
-    x=data.index,
-    y=data["EMA50"],
-    name="EMA50"
-))
-
-st.plotly_chart(fig, use_container_width=True)
-
-# ---------- MOMENTUM ----------
-
-st.subheader("Momentum")
-
-st.line_chart(data["Momentum"])
-
-# ---------- MACD ----------
-
-st.subheader("MACD")
-
-st.line_chart(data[["MACD","MACD_signal"]])
-
-# ---------- RVOL ----------
-
-st.subheader("Relative Volume")
-
-st.line_chart(data["RVOL"])
-
-# ---------- STATUS ----------
-
-st.subheader("Signal Status")
-
-if latest["Breakout"]:
-    st.success("🚀 BREAKOUT DETECTED")
-else:
-    st.warning("No Signal")
+st.plotly_chart(fig)
